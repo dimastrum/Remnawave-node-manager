@@ -32,7 +32,7 @@ info 'ШАГ 1/9 — Обновление пакетов Ubuntu...'
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get upgrade -y
-apt-get install -y ca-certificates curl python3 openssh-server iproute2 ufw logrotate
+apt-get install -y ca-certificates curl python3 python3-systemd openssh-server iproute2 ufw logrotate fail2ban
 
 # Avoid locking out an active SSH session when enabling the firewall.
 if [[ -n "${SSH_CONNECTION:-}" ]]; then
@@ -141,14 +141,8 @@ ROTATE
 fi
 logrotate -d "$ROTATE_FILE" >/dev/null 2>&1 || fail 'Ошибка проверки Logrotate.'
 
-info 'ШАГ 7/9 — Отключение автоматических блокировок Fail2Ban...'
-# Fail2Ban may have been installed by an older release. Stop it to prevent
-# dynamically generated UFW REJECT/DENY rules; leave its files untouched.
-if systemctl list-unit-files fail2ban.service --no-legend 2>/dev/null | grep -q '^fail2ban.service'; then
-  systemctl disable --now fail2ban || fail 'Не удалось остановить Fail2Ban.'
-  systemctl is-active --quiet fail2ban && fail 'Fail2Ban всё ещё активен.'
-fi
-printf '[OK] Автоматические блокировки Fail2Ban отключены.\n'
+info 'ШАГ 7/9 — Включение защиты SSH через Fail2Ban...'
+configure_fail2ban
 
 info 'ШАГ 8/9 — Настройка UFW...'
 # Existing rules may weaken the intended policy. Refuse to proceed rather
@@ -224,7 +218,9 @@ ufw reload
 
 info 'ШАГ 9/9 — Итоговая проверка...'
 systemctl is-active --quiet docker || fail 'Docker не запущен.'
-if systemctl is-active --quiet fail2ban 2>/dev/null; then fail 'Fail2Ban активен и может добавлять динамические правила UFW.'; fi
+systemctl is-active --quiet fail2ban || fail 'Fail2Ban не запущен.'
+systemctl is-enabled --quiet fail2ban || fail 'Автозапуск Fail2Ban не включён.'
+fail2ban-client status sshd >/dev/null || fail 'Защита SSH (jail sshd) не работает.'
 [[ "$(docker inspect -f '{{.State.Running}}' remnanode)" == true ]] || fail 'RemnaNode остановлена.'
 ufw status | grep -q '^Status: active' || fail 'UFW неактивен.'
 mount_ok=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/log/remnanode"}}{{.Source}}{{end}}{{end}}' remnanode)
@@ -232,7 +228,7 @@ mount_ok=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/log/re
 logrotate -d "$ROTATE_FILE" >/dev/null 2>&1 || fail 'Ошибка проверки Logrotate.'
 printf '\n========== REMNAWAVE NODE MANAGER — УСТАНОВКА ЗАВЕРШЕНА ==========\n'
 printf '[OK] Docker: работает\n[OK] RemnaNode: запущена\n[OK] Панель: активное TCP-соединение подтверждено\n'
-printf '[OK] Fail2Ban: отключён (нет автоматических блокировок)\n[OK] Logrotate: настроен\n[OK] UFW: работает\n[OK] Логи Xray: каталог примонтирован\n'
+printf '[OK] Fail2Ban: защита SSH работает, автозапуск включён\n[OK] Logrotate: настроен\n[OK] UFW: работает\n[OK] Логи Xray: каталог примонтирован\n'
 printf '\n'
 ufw status verbose
 printf '\nПРИМЕЧАНИЕ: Включите запись логов Xray в файлы через профиль панели Remnawave.\n'
@@ -241,6 +237,44 @@ if [[ -f /var/run/reboot-required ]]; then
   printf 'ПРИМЕЧАНИЕ: После обновлений требуется перезагрузка Ubuntu. Выполните её вручную.\n'
 fi
 
+}
+
+configure_fail2ban() {
+  # Resume also supports installations made before Fail2Ban was enabled.
+  if ! command -v fail2ban-client >/dev/null 2>&1 || ! python3 -c 'import systemd.journal' >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban python3-systemd
+  fi
+  # Configure only sshd; preserve jail.local and settings for other services.
+  # An explicit multiport action limits this jail's bans to SSH TCP port 22.
+  mkdir -p /etc/fail2ban/jail.d
+  cat > /etc/fail2ban/jail.d/99-remnanode-sshd.local <<'FAIL2BAN'
+# Managed by Remnawave Node Manager: SSH protection only.
+[sshd]
+enabled = true
+backend = systemd
+journalmatch = _SYSTEMD_UNIT=ssh.service
+port = 22
+protocol = tcp
+bantime = 24h
+findtime = 10m
+maxretry = 5
+action = iptables-multiport[name=sshd, port="22", protocol=tcp]
+FAIL2BAN
+  chmod 600 /etc/fail2ban/jail.d/99-remnanode-sshd.local
+  fail2ban-client -t || fail 'Конфигурация Fail2Ban некорректна; служба не перезапущена.'
+  systemctl enable fail2ban || fail 'Не удалось включить автозапуск Fail2Ban.'
+  systemctl restart fail2ban || fail 'Не удалось запустить Fail2Ban.'
+  # systemctl restart may return before the client socket/jail is ready.
+  local attempt
+  for ((attempt=0; attempt<10; attempt++)); do
+    if fail2ban-client status sshd >/dev/null 2>&1; then
+      printf '[OK] Fail2Ban: защита SSH включена (5 ошибок за 10 минут, блокировка на 24 часа).\n'
+      return 0
+    fi
+    sleep 1
+  done
+  fail 'Fail2Ban не подтвердил запуск защиты SSH (jail sshd).'
 }
 
 resume_mode() {
@@ -319,7 +353,11 @@ audit_mode() {
   if [[ -f "$ROTATE_FILE" ]]; then
     if command -v logrotate >/dev/null 2>&1 && logrotate -d "$ROTATE_FILE" >/dev/null 2>&1; then mark OK 'Конфигурация Logrotate корректна'; else mark WARN 'Logrotate не установлен или конфигурация некорректна'; fi
   else mark FAIL 'Конфигурация Logrotate отсутствует'; fi
-  if systemctl is-active --quiet fail2ban 2>/dev/null; then mark WARN 'Fail2Ban активен и может добавлять динамические правила UFW'; else mark OK 'Fail2Ban отключён: автоматических блокировок нет'; fi
+  check_service fail2ban
+  if systemctl is-enabled --quiet fail2ban 2>/dev/null; then mark OK 'Автозапуск Fail2Ban включён'; else mark FAIL 'Автозапуск Fail2Ban отключён'; fi
+  if command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client status sshd >/dev/null 2>&1; then
+    mark OK 'Защита SSH через Fail2Ban (jail sshd) работает'
+  else mark FAIL 'Защита SSH через Fail2Ban (jail sshd) не работает'; fi
   printf '\n--- ПРАВИЛА UFW ---\n'
   if command -v ufw >/dev/null 2>&1; then
     local rules panel_ip
