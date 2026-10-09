@@ -587,10 +587,79 @@ PYPORTS
 
 }
 
+menu_status() {
+  local label="$1" level="$2" message="$3" color='' reset=''
+  local LC_CTYPE=C.UTF-8
+  if [[ -t 1 && "${TERM:-dumb}" != dumb && -z "${NO_COLOR+x}" ]]; then
+    reset=$'\033[0m'
+    case "$level" in
+      OK) color=$'\033[32m' ;;
+      FAIL) color=$'\033[31m' ;;
+      *) color=$'\033[33m' ;;
+    esac
+  fi
+  # Bash printf field width counts bytes; pad separately for Cyrillic labels.
+  printf '  %s%*s %b●%b %s\n' "$label" "$((14-${#label}))" '' "$color" "$reset" "$message"
+}
+
+show_menu() {
+  local state firewall_active=false
+  printf '\n╭──────────────────────────────────────╮\n│       REMNAWAVE NODE MANAGER         │\n│                v0.2.9                │\n╰──────────────────────────────────────╯\n\n'
+  if ! command -v docker >/dev/null 2>&1; then
+    menu_status 'Нода' WARN 'Не установлена'
+  elif ! docker info >/dev/null 2>&1; then
+    menu_status 'Нода' WARN 'Не определён (Docker недоступен)'
+  else
+    state=$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null || true)
+    case "$state" in
+      running) menu_status 'Нода' OK 'Работает' ;;
+      '') menu_status 'Нода' WARN 'Не установлена' ;;
+      restarting) menu_status 'Нода' WARN 'Перезапускается' ;;
+      paused) menu_status 'Нода' WARN 'Приостановлена' ;;
+      *) menu_status 'Нода' FAIL 'Остановлена' ;;
+    esac
+  fi
+  if ! command -v ufw >/dev/null 2>&1; then
+    menu_status 'Firewall' WARN 'Не установлен'
+  elif ufw status 2>/dev/null | grep -q '^Status: active'; then
+    firewall_active=true
+    menu_status 'Firewall' OK 'Включён'
+  else
+    menu_status 'Firewall' FAIL 'Выключен или недоступен'
+  fi
+  if systemctl is-active --quiet fail2ban 2>/dev/null && command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client status sshd >/dev/null 2>&1; then
+    menu_status 'Защита SSH' OK 'Включена'
+  else
+    menu_status 'Защита SSH' FAIL 'Выключена или недоступна'
+  fi
+  # Read applied UFW IPv4 rules, rather than an unapplied before.rules file.
+  # This describes UFW's ping rule, not reachability through a provider firewall.
+  if [[ "$firewall_active" == true ]] && command -v iptables >/dev/null 2>&1; then
+    if iptables -w 2 -C ufw-before-input -p icmp --icmp-type echo-request -j DROP >/dev/null 2>&1; then
+      menu_status 'Ping (IPv4)' OK 'Запрещён'
+    elif iptables -w 2 -C ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT >/dev/null 2>&1; then
+      menu_status 'Ping (IPv4)' WARN 'Разрешён'
+    else
+      menu_status 'Ping (IPv4)' WARN 'Не определён'
+    fi
+  else
+    menu_status 'Ping (IPv4)' WARN 'Не определён'
+  fi
+  if [[ ! -f "$ROTATE_FILE" ]]; then
+    menu_status 'Logrotate' WARN 'Не настроен'
+  elif ! command -v logrotate >/dev/null 2>&1; then
+    menu_status 'Logrotate' WARN 'Не установлен'
+  elif logrotate -d "$ROTATE_FILE" >/dev/null 2>&1; then
+    menu_status 'Logrotate' OK 'Настроен'
+  else
+    menu_status 'Logrotate' FAIL 'Ошибка конфигурации'
+  fi
+  printf '\n  1  Установить ноду\n  2  Проверить ноду\n  3  Продолжить установку\n\n  0  Выход\n\n'
+}
+
 [[ "$EUID" -eq 0 ]] || fail 'Запустите от root или через sudo.'
 [[ -t 0 ]] || fail 'Нужен интерактивный терминал.'
-printf '\n╔══════════════════════════════════════════╗\n║     REMNAWAVE NODE MANAGER v0.2.9       ║\n╚══════════════════════════════════════════╝\n'
-printf '  1. Установить новую RemnaNode\n  2. Проверить существующую ноду (без изменений)\n  3. Завершить незавершённую установку\n  0. Выход\n\n'
+show_menu
 read -r -p 'Выберите пункт: ' choice
 case "$choice" in
   1) install_mode ;;
