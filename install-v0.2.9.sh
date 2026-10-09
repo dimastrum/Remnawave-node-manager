@@ -284,6 +284,31 @@ FAIL2BAN
   fail 'Fail2Ban не подтвердил запуск защиты SSH (jail sshd).'
 }
 
+resume_node() {
+  local state mount image
+  state=$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null || true)
+  if [[ -n "$state" ]]; then
+    mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/log/remnanode"}}{{.Source}}{{end}}{{end}}' remnanode)
+    [[ "$mount" == "$LOG_DIR" ]] || fail 'У существующего контейнера remnanode отсутствует ожидаемый каталог логов; автоматический запуск запрещён.'
+  fi
+  if [[ "$state" == running ]]; then
+    info 'RemnaNode уже работает; скачивание образа и повторный запуск не требуются.'
+    return 0
+  fi
+  [[ "$state" != paused ]] || fail 'RemnaNode приостановлена. Сначала снимите паузу вручную.'
+  mkdir -p "$LOG_DIR"
+  image=$(cd "$NODE_DIR" && docker compose config --images remnanode)
+  [[ -n "$image" && "$image" != *$'\n'* ]] || fail 'Не удалось однозначно определить образ сервиса remnanode.'
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    info 'ШАГ 7/9 — Повторная загрузка отсутствующего образа RemnaNode...'
+    (cd "$NODE_DIR" && docker compose pull remnanode) || fail 'Не удалось скачать образ. Проверьте доступ к registry и повторите пункт 3.'
+  fi
+  info 'ШАГ 7/9 — Создание или запуск остановленной RemnaNode...'
+  # Reuse the local image; resuming must not implicitly pull a newer latest.
+  (cd "$NODE_DIR" && docker compose up -d --pull never --no-build remnanode) || fail 'Не удалось запустить RemnaNode. Исправьте причину ошибки и повторите пункт 3.'
+  [[ "$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null || true)" == running ]] || fail 'RemnaNode не перешла в состояние running. Проверьте docker logs remnanode.'
+}
+
 resume_mode() {
   [[ "$EUID" -eq 0 && -t 0 ]] || fail 'Требуется root и интерактивный терминал.'
   [[ -r /etc/os-release ]] || fail 'Не удалось определить ОС.'
@@ -295,10 +320,6 @@ resume_mode() {
   done
   docker compose version >/dev/null 2>&1 || fail 'Docker Compose отсутствует.'
   (cd "$NODE_DIR" && docker compose config -q) || fail 'Конфигурация Compose некорректна.'
-  [[ "$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null || true)" == running ]] || fail 'RemnaNode не запущена.'
-  local mount
-  mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/log/remnanode"}}{{.Source}}{{end}}{{end}}' remnanode)
-  [[ "$mount" == "$LOG_DIR" ]] || fail 'У RemnaNode отсутствует ожидаемое подключение каталога логов.'
   ss -H -ltn '( sport = :22 )' | grep -q . || fail 'SSH не слушает порт 22.'
   if [[ -n "${SSH_CONNECTION:-}" ]]; then
     local a b c ssh_port
@@ -309,6 +330,9 @@ resume_mode() {
   validate_panel_ip "$PANEL_IP" || fail 'Некорректный публичный IPv4 панели.'
   info 'Применяем настройки безопасности и проверяем соединение после включения UFW.'
   configure_security
+  systemctl enable --now docker || fail 'Не удалось запустить Docker.'
+  systemctl is-active --quiet docker || fail 'Docker не запущен.'
+  resume_node
   info 'ШАГ 8/9 — Проверка текущего TCP-соединения с панелью (до 60 секунд)...'
   if ! check_panel_connection "$PANEL_IP" 60; then
     fail 'Не удалось подтвердить TCP-соединение с панелью после настройки UFW. Проверьте IP, настройки панели и firewall провайдера.'
