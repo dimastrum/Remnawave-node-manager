@@ -7,11 +7,75 @@ readonly COMPOSE_FILE="$NODE_DIR/docker-compose.yml"
 readonly LOG_DIR=/var/log/remnanode
 readonly ROTATE_FILE=/etc/logrotate.d/remnanode
 readonly UFW_BEFORE=/etc/ufw/before.rules
-info() { printf '\n[REMNAWAVE] %s\n' "$*"; }
-fail() { printf '\n[REMNAWAVE] ОШИБКА: %s\n' "$*" >&2; exit 1; }
-trap 'printf "\n[REMNAWAVE] Ошибка в строке %s (код %s).\n" "$LINENO" "$?" >&2' ERR
+info() {
+  if [[ "${REPORT_ACTIVE:-false}" == true && "$*" =~ ^ШАГ\ ([1-9])/9 ]]; then
+    REPORT_CURRENT=${BASH_REMATCH[1]}
+  fi
+  printf '\n[REMNAWAVE] %s\n' "$*"
+}
+fail() { REPORT_ERROR="$*"; printf '\n[REMNAWAVE] ОШИБКА: %s\n' "$*" >&2; exit 1; }
+on_error() {
+  printf '\n[REMNAWAVE] Ошибка в строке %s (код %s).\n' "$2" "$1" >&2
+  REPORT_ERROR="Ошибка команды в строке $2 (код $1)."
+}
+trap 'on_error "$?" "$LINENO"' ERR
+trap 'finish_report "$?"' EXIT
+
+report_init() {
+  REPORT_ACTIVE=true REPORT_CURRENT=0 REPORT_ERROR=''
+  REPORT_LABELS=('' 'Пакеты Ubuntu' 'Docker и Compose' 'Конфигурация ноды' 'Logrotate' 'Firewall' 'Защита SSH' 'RemnaNode' 'Соединение с панелью' 'Итоговая проверка')
+  REPORT_STATES=('' SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP)
+  REPORT_MESSAGES=('' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не проверено' 'Не выполнено')
+}
+report_done() {
+  REPORT_STATES[$1]=OK
+  REPORT_MESSAGES[$1]="$2"
+  REPORT_CURRENT=0
+}
+print_report() {
+  local code="$1" i symbol label
+  local LC_CTYPE=C.UTF-8
+  printf '\n╭──────────────────────────────────────────────────╮\n│             REMNAWAVE NODE MANAGER               │\n│              Результат установки                 │\n╰──────────────────────────────────────────────────╯\n\n'
+  for ((i=1; i<=9; i++)); do
+    case "${REPORT_STATES[$i]}" in
+      OK) symbol='✓' ;;
+      FAIL) symbol='✗' ;;
+      *) symbol='·' ;;
+    esac
+    label=${REPORT_LABELS[$i]}
+    printf '  %s  %s/9  %s%*s %s\n' "$symbol" "$i" "$label" "$((22-${#label}))" '' "${REPORT_MESSAGES[$i]}"
+  done
+  printf '\n  ────────────────────────────────────────────────\n'
+  if (( code == 0 )); then
+    local ping='Не определён'
+    if command -v iptables >/dev/null 2>&1; then
+      if iptables -w 2 -C ufw-before-input -p icmp --icmp-type echo-request -j DROP >/dev/null 2>&1; then ping='Запрещён'
+      elif iptables -w 2 -C ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT >/dev/null 2>&1; then ping='Разрешён'; fi
+    fi
+    printf '  Ping IPv4       %s\n  API ноды        2222/TCP\n  Защита SSH      5 ошибок → блокировка на 24 часа\n' "$ping"
+    printf '  ────────────────────────────────────────────────\n\n  ✓ Установка завершена\n\n'
+    printf '  ! Включите запись логов Xray в профиле панели.\n'
+    printf '  ! Блокировка ICMP может мешать PMTU Discovery и диагностике.\n'
+    if [[ -f /var/run/reboot-required ]]; then printf '  ! Требуется перезагрузка Ubuntu.\n'; fi
+  else
+    printf '\n  ✗ Установка не завершена\n  Причина: %s\n' "${REPORT_ERROR:-Выполнение прервано (код $code).}"
+    printf '\n  Исправьте причину ошибки. Если Compose уже создан,\n  выберите пункт 3 — «Продолжить установку».\n'
+  fi
+}
+finish_report() {
+  # Subshell failures propagate to the parent; print the summary only once.
+  [[ "${REPORT_ACTIVE:-false}" == true && "$BASH_SUBSHELL" -eq 0 ]] || return 0
+  local code="$1"
+  if (( code != 0 && REPORT_CURRENT > 0 )); then
+    REPORT_STATES[$REPORT_CURRENT]=FAIL
+    REPORT_MESSAGES[$REPORT_CURRENT]='Ошибка'
+  fi
+  REPORT_ACTIVE=false
+  print_report "$code"
+}
 
 install_mode() {
+report_init
 [[ "$EUID" -eq 0 ]] || fail 'Запустите от root или через sudo.'
 [[ -t 0 ]] || fail 'Нужен интерактивный терминал для ввода SECRET_KEY и IP панели.'
 info 'Сначала введите параметры подключения Remnawave...'
@@ -33,6 +97,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get upgrade -y
 apt-get install -y ca-certificates curl python3 python3-systemd openssh-server iproute2 ufw logrotate fail2ban
+report_done 1 'Обновлены'
 
 # Avoid locking out an active SSH session when enabling the firewall.
 if [[ -n "${SSH_CONNECTION:-}" ]]; then
@@ -52,6 +117,7 @@ fi
 docker compose version >/dev/null || fail 'Плагин Docker Compose отсутствует.'
 systemctl enable --now docker
 systemctl is-active --quiet docker || fail 'Служба Docker не запущена.'
+report_done 2 'Работают'
 
 info 'ШАГ 3/9 — Создание конфигурации RemnaNode...'
 mkdir -p "$NODE_DIR" "$LOG_DIR"
@@ -72,6 +138,7 @@ chmod 600 "$COMPOSE_FILE"
 unset SECRET_KEY
 unset REMNAWAVE_COMPOSE_FILE
 (cd "$NODE_DIR" && docker compose config -q) || fail 'Ошибка проверки конфигурации Docker Compose.'
+report_done 3 'Создана'
 
 # Apply firewall restrictions before exposing the node's host-network API.
 configure_security
@@ -79,11 +146,13 @@ configure_security
 info 'ШАГ 7/9 — Загрузка образа и запуск RemnaNode...'
 (cd "$NODE_DIR" && docker compose pull && docker compose up -d)
 (cd "$NODE_DIR" && docker compose ps)
+report_done 7 'Запущена'
 
 info 'ШАГ 8/9 — Проверка TCP-соединения с панелью после настройки UFW (до 60 секунд)...'
 if ! check_panel_connection "$PANEL_IP" 60; then
   fail 'Нет активного TCP-соединения rw-node с указанным IP панели. UFW уже включён. Проверьте IP, настройки панели и firewall провайдера, затем используйте пункт 3.'
 fi
+report_done 8 'Подтверждено'
 verify_installation
 }
 
@@ -143,6 +212,7 @@ cat > "$ROTATE_FILE" <<'ROTATE'
 ROTATE
 fi
 logrotate -d "$ROTATE_FILE" >/dev/null 2>&1 || fail 'Ошибка проверки Logrotate.'
+report_done 4 'Настроен'
 
 info 'ШАГ 5/9 — Настройка UFW до запуска RemnaNode...'
 # Existing rules may weaken the intended policy. Refuse to proceed rather
@@ -215,10 +285,12 @@ ufw allow from "$PANEL_IP" to any port 2222 proto tcp comment 'Remnawave Node AP
 ufw --force enable
 ufw reload
 ufw status | grep -q '^Status: active' || fail 'UFW неактивен; запуск ноды запрещён.'
+report_done 5 'Включён'
 
 # Start/restart Fail2Ban after UFW has finished applying its rules.
 info 'ШАГ 6/9 — Включение защиты SSH через Fail2Ban...'
 configure_fail2ban
+report_done 6 'Включена'
 }
 
 verify_installation() {
@@ -232,16 +304,8 @@ ufw status | grep -q '^Status: active' || fail 'UFW неактивен.'
 mount_ok=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/log/remnanode"}}{{.Source}}{{end}}{{end}}' remnanode)
 [[ "$mount_ok" == "$LOG_DIR" ]] || fail 'Каталог логов не примонтирован в RemnaNode.'
 logrotate -d "$ROTATE_FILE" >/dev/null 2>&1 || fail 'Ошибка проверки Logrotate.'
-printf '\n========== REMNAWAVE NODE MANAGER — УСТАНОВКА ЗАВЕРШЕНА ==========\n'
-printf '[OK] Docker: работает\n[OK] RemnaNode: запущена\n[OK] Панель: активное TCP-соединение подтверждено\n'
-printf '[OK] Fail2Ban: защита SSH работает, автозапуск включён\n[OK] Logrotate: настроен\n[OK] UFW: работает\n[OK] Логи Xray: каталог примонтирован\n'
-printf '\n'
-ufw status verbose
-printf '\nПРИМЕЧАНИЕ: Включите запись логов Xray в файлы через профиль панели Remnawave.\n'
-printf 'ВНИМАНИЕ: Блокировка ICMP может нарушать PMTU Discovery и диагностику сети.\n'
-if [[ -f /var/run/reboot-required ]]; then
-  printf 'ПРИМЕЧАНИЕ: После обновлений требуется перезагрузка Ubuntu. Выполните её вручную.\n'
-fi
+report_done 9 'Пройдена'
+finish_report 0
 unset PANEL_IP
 
 }
@@ -310,6 +374,8 @@ resume_node() {
 }
 
 resume_mode() {
+  report_init
+  REPORT_MESSAGES[1]='Не обновлялись'
   [[ "$EUID" -eq 0 && -t 0 ]] || fail 'Требуется root и интерактивный терминал.'
   [[ -r /etc/os-release ]] || fail 'Не удалось определить ОС.'
   . /etc/os-release
@@ -319,7 +385,9 @@ resume_mode() {
     command -v "$cmd" >/dev/null 2>&1 || fail "Не найдена команда $cmd. Для завершения сначала установите необходимый пакет вручную."
   done
   docker compose version >/dev/null 2>&1 || fail 'Docker Compose отсутствует.'
+  info 'ШАГ 3/9 — Проверка существующей конфигурации RemnaNode...'
   (cd "$NODE_DIR" && docker compose config -q) || fail 'Конфигурация Compose некорректна.'
+  report_done 3 'Проверена'
   ss -H -ltn '( sport = :22 )' | grep -q . || fail 'SSH не слушает порт 22.'
   if [[ -n "${SSH_CONNECTION:-}" ]]; then
     local a b c ssh_port
@@ -330,13 +398,18 @@ resume_mode() {
   validate_panel_ip "$PANEL_IP" || fail 'Некорректный публичный IPv4 панели.'
   info 'Применяем настройки безопасности и проверяем соединение после включения UFW.'
   configure_security
+  info 'ШАГ 7/9 — Восстановление запуска RemnaNode...'
   systemctl enable --now docker || fail 'Не удалось запустить Docker.'
   systemctl is-active --quiet docker || fail 'Docker не запущен.'
+  report_done 2 'Работают'
+  REPORT_CURRENT=7
   resume_node
+  report_done 7 'Работает'
   info 'ШАГ 8/9 — Проверка текущего TCP-соединения с панелью (до 60 секунд)...'
   if ! check_panel_connection "$PANEL_IP" 60; then
     fail 'Не удалось подтвердить TCP-соединение с панелью после настройки UFW. Проверьте IP, настройки панели и firewall провайдера.'
   fi
+  report_done 8 'Подтверждено'
   verify_installation
 }
 
