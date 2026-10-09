@@ -40,6 +40,7 @@ if [[ -n "${SSH_CONNECTION:-}" ]]; then
   [[ "$ssh_port" == '22' ]] || fail "Текущая SSH-сессия использует порт $ssh_port вместо 22."
 fi
 ss -H -ltn '( sport = :22 )' | grep -q . || fail 'SSH не слушает TCP-порт 22.'
+validate_panel_ip "$PANEL_IP" || fail 'Укажите корректный публичный IPv4 панели.'
 
 info 'ШАГ 2/9 — Установка и проверка Docker...'
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
@@ -53,7 +54,6 @@ systemctl enable --now docker
 systemctl is-active --quiet docker || fail 'Служба Docker не запущена.'
 
 info 'ШАГ 3/9 — Создание конфигурации RemnaNode...'
-validate_panel_ip "$PANEL_IP" || fail 'Укажите корректный публичный IPv4 панели.'
 mkdir -p "$NODE_DIR" "$LOG_DIR"
 chmod 700 "$NODE_DIR"
 # Insert secret as a YAML-quoted scalar, not as shell-expanded text.
@@ -73,15 +73,18 @@ unset SECRET_KEY
 unset REMNAWAVE_COMPOSE_FILE
 (cd "$NODE_DIR" && docker compose config -q) || fail 'Ошибка проверки конфигурации Docker Compose.'
 
-info 'ШАГ 4/9 — Загрузка образа и запуск RemnaNode...'
+# Apply firewall restrictions before exposing the node's host-network API.
+configure_security
+
+info 'ШАГ 7/9 — Загрузка образа и запуск RemnaNode...'
 (cd "$NODE_DIR" && docker compose pull && docker compose up -d)
 (cd "$NODE_DIR" && docker compose ps)
 
-info 'ШАГ 5/9 — Проверка TCP-соединения с панелью (до 60 секунд)...'
+info 'ШАГ 8/9 — Проверка TCP-соединения с панелью после настройки UFW (до 60 секунд)...'
 if ! check_panel_connection "$PANEL_IP" 60; then
-  fail 'Нет активного TCP-соединения rw-node с указанным IP панели. UFW пока не настроен. Проверьте IP и подключение, затем используйте пункт 3.'
+  fail 'Нет активного TCP-соединения rw-node с указанным IP панели. UFW уже включён. Проверьте IP, настройки панели и firewall провайдера, затем используйте пункт 3.'
 fi
-configure_security
+verify_installation
 }
 
 # Confirm a live connection owned by rw-node, from the expected panel IP.
@@ -125,7 +128,7 @@ PYIP
 }
 
 configure_security() {
-info 'ШАГ 6/9 — Настройка Logrotate...'
+info 'ШАГ 4/9 — Настройка Logrotate...'
 if [[ ! -e "$ROTATE_FILE" ]]; then
 cat > "$ROTATE_FILE" <<'ROTATE'
 /var/log/remnanode/*.log {
@@ -141,10 +144,7 @@ ROTATE
 fi
 logrotate -d "$ROTATE_FILE" >/dev/null 2>&1 || fail 'Ошибка проверки Logrotate.'
 
-info 'ШАГ 7/9 — Включение защиты SSH через Fail2Ban...'
-configure_fail2ban
-
-info 'ШАГ 8/9 — Настройка UFW...'
+info 'ШАГ 5/9 — Настройка UFW до запуска RemnaNode...'
 # Existing rules may weaken the intended policy. Refuse to proceed rather
 # than resetting the firewall or deleting the user's existing rules.
 if ufw status | grep -Eiq '^2222(/tcp)?[[:space:]]+ALLOW[[:space:]]+Anywhere'; then
@@ -212,10 +212,16 @@ ufw allow 22/tcp comment 'SSH'
 ufw allow 80/tcp comment 'HTTP'
 ufw allow 443/tcp comment 'Remnawave Xray Inbound'
 ufw allow from "$PANEL_IP" to any port 2222 proto tcp comment 'Remnawave Node API'
-unset PANEL_IP
 ufw --force enable
 ufw reload
+ufw status | grep -q '^Status: active' || fail 'UFW неактивен; запуск ноды запрещён.'
 
+# Start/restart Fail2Ban after UFW has finished applying its rules.
+info 'ШАГ 6/9 — Включение защиты SSH через Fail2Ban...'
+configure_fail2ban
+}
+
+verify_installation() {
 info 'ШАГ 9/9 — Итоговая проверка...'
 systemctl is-active --quiet docker || fail 'Docker не запущен.'
 systemctl is-active --quiet fail2ban || fail 'Fail2Ban не запущен.'
@@ -236,6 +242,7 @@ printf 'ВНИМАНИЕ: Блокировка ICMP может нарушать 
 if [[ -f /var/run/reboot-required ]]; then
   printf 'ПРИМЕЧАНИЕ: После обновлений требуется перезагрузка Ubuntu. Выполните её вручную.\n'
 fi
+unset PANEL_IP
 
 }
 
@@ -300,12 +307,13 @@ resume_mode() {
   fi
   read -r -p 'Публичный IPv4 панели Remnawave: ' PANEL_IP
   validate_panel_ip "$PANEL_IP" || fail 'Некорректный публичный IPv4 панели.'
-  info 'Проверка текущего TCP-соединения с панелью (до 60 секунд)...'
-  if ! check_panel_connection "$PANEL_IP" 60; then
-    fail 'Не удалось подтвердить TCP-соединение с панелью. Настройки безопасности не изменены.'
-  fi
-  info 'Продолжаем только шаги 6–9. Ubuntu, Docker и RemnaNode не переустанавливаются.'
+  info 'Применяем настройки безопасности и проверяем соединение после включения UFW.'
   configure_security
+  info 'ШАГ 8/9 — Проверка текущего TCP-соединения с панелью (до 60 секунд)...'
+  if ! check_panel_connection "$PANEL_IP" 60; then
+    fail 'Не удалось подтвердить TCP-соединение с панелью после настройки UFW. Проверьте IP, настройки панели и firewall провайдера.'
+  fi
+  verify_installation
 }
 
 mark() {
