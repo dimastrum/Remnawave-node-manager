@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="banner.png" alt="Remnawave Node Manager" width="100%">
+</p>
+
 # Remnawave Node Manager
 
 Установка и проверка RemnaNode для **Ubuntu 24.04 LTS**.
