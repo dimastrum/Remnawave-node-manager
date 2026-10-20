@@ -7,8 +7,9 @@ readonly COMPOSE_FILE="$NODE_DIR/docker-compose.yml"
 readonly LOG_DIR=/var/log/remnanode
 readonly ROTATE_FILE=/etc/logrotate.d/remnanode
 readonly UFW_BEFORE=/etc/ufw/before.rules
+readonly BBR_FILE=/etc/sysctl.d/99-zz-remnanode-bbr.conf
 info() {
-  if [[ "${REPORT_ACTIVE:-false}" == true && "$*" =~ ^ШАГ\ ([1-9])/9 ]]; then
+  if [[ "${REPORT_ACTIVE:-false}" == true && "$*" =~ ^ШАГ\ ([1-9]|10)/10 ]]; then
     REPORT_CURRENT=${BASH_REMATCH[1]}
   fi
   printf '\n[REMNAWAVE] %s\n' "$*"
@@ -23,9 +24,9 @@ trap 'finish_report "$?"' EXIT
 
 report_init() {
   REPORT_ACTIVE=true REPORT_CURRENT=0 REPORT_ERROR=''
-  REPORT_LABELS=('' 'Пакеты Ubuntu' 'Docker и Compose' 'Конфигурация ноды' 'Logrotate' 'Firewall' 'Защита SSH' 'RemnaNode' 'Соединение с панелью' 'Итоговая проверка')
-  REPORT_STATES=('' SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP)
-  REPORT_MESSAGES=('' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не проверено' 'Не выполнено')
+  REPORT_LABELS=('' 'Пакеты Ubuntu' 'Docker и Compose' 'Конфигурация ноды' 'Logrotate' 'Firewall' 'Защита SSH' 'RemnaNode' 'Соединение с панелью' 'BBR' 'Итоговая проверка')
+  REPORT_STATES=('' SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP)
+  REPORT_MESSAGES=('' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не выполнено' 'Не проверено' 'Не выполнено' 'Не выполнено')
 }
 report_done() {
   REPORT_STATES[$1]=OK
@@ -36,14 +37,14 @@ print_report() {
   local code="$1" i symbol label
   local LC_CTYPE=C.UTF-8
   printf '\n╭──────────────────────────────────────────────────╮\n│             REMNAWAVE NODE MANAGER               │\n│              Результат установки                 │\n╰──────────────────────────────────────────────────╯\n\n'
-  for ((i=1; i<=9; i++)); do
+  for ((i=1; i<=10; i++)); do
     case "${REPORT_STATES[$i]}" in
       OK) symbol='✓' ;;
       FAIL) symbol='✗' ;;
       *) symbol='·' ;;
     esac
     label=${REPORT_LABELS[$i]}
-    printf '  %s  %s/9  %s%*s %s\n' "$symbol" "$i" "$label" "$((22-${#label}))" '' "${REPORT_MESSAGES[$i]}"
+    printf '  %s  %2s/10  %s%*s %s\n' "$symbol" "$i" "$label" "$((22-${#label}))" '' "${REPORT_MESSAGES[$i]}"
   done
   printf '\n  ────────────────────────────────────────────────\n'
   if (( code == 0 )); then
@@ -53,6 +54,7 @@ print_report() {
       elif iptables -w 2 -C ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT >/dev/null 2>&1; then ping='Разрешён'; fi
     fi
     printf '  Ping IPv4       %s\n  API ноды        2222/TCP\n  Защита SSH      5 ошибок → блокировка на 24 часа\n' "$ping"
+    printf '  BBR             Активен (fq)\n'
     printf '  ────────────────────────────────────────────────\n\n  ✓ Установка завершена\n\n'
     printf '  ! Включите запись логов Xray в профиле панели.\n'
     printf '  ! Блокировка ICMP может мешать PMTU Discovery и диагностике.\n'
@@ -92,11 +94,11 @@ read -r -p 'Публичный IPv4 панели (доступ к API ноды, 
 [[ ! -e "$COMPOSE_FILE" && ! -e "$NODE_DIR/.env" && ! -e "$NODE_DIR/docker-compose.override.yml" ]] || fail 'Обнаружена существующая конфигурация RemnaNode; перезапись запрещена.'
 [[ ! -e "$ROTATE_FILE" ]] || fail "Файл $ROTATE_FILE уже существует; перезапись запрещена."
 
-info 'ШАГ 1/9 — Обновление пакетов Ubuntu...'
+info 'ШАГ 1/10 — Обновление пакетов Ubuntu...'
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get upgrade -y
-apt-get install -y ca-certificates curl python3 python3-systemd openssh-server iproute2 ufw logrotate fail2ban
+apt-get install -y ca-certificates curl python3 python3-systemd openssh-server iproute2 ufw logrotate fail2ban procps kmod
 report_done 1 'Обновлены'
 
 # Avoid locking out an active SSH session when enabling the firewall.
@@ -107,7 +109,7 @@ fi
 ss -H -ltn '( sport = :22 )' | grep -q . || fail 'SSH не слушает TCP-порт 22.'
 validate_panel_ip "$PANEL_IP" || fail 'Укажите корректный публичный IPv4 панели.'
 
-info 'ШАГ 2/9 — Установка и проверка Docker...'
+info 'ШАГ 2/10 — Установка и проверка Docker...'
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
   installer=$(mktemp /tmp/remnanode-docker.XXXXXXXX)
   curl -fsSL https://get.docker.com -o "$installer" || fail 'Не удалось скачать установщик Docker.'
@@ -119,7 +121,7 @@ systemctl enable --now docker
 systemctl is-active --quiet docker || fail 'Служба Docker не запущена.'
 report_done 2 'Работают'
 
-info 'ШАГ 3/9 — Создание конфигурации RemnaNode...'
+info 'ШАГ 3/10 — Создание конфигурации RemnaNode...'
 mkdir -p "$NODE_DIR" "$LOG_DIR"
 chmod 700 "$NODE_DIR"
 # Insert secret as a YAML-quoted scalar, not as shell-expanded text.
@@ -143,12 +145,12 @@ report_done 3 'Создана'
 # Apply firewall restrictions before exposing the node's host-network API.
 configure_security
 
-info 'ШАГ 7/9 — Загрузка образа и запуск RemnaNode...'
+info 'ШАГ 7/10 — Загрузка образа и запуск RemnaNode...'
 (cd "$NODE_DIR" && docker compose pull && docker compose up -d)
 (cd "$NODE_DIR" && docker compose ps)
 report_done 7 'Запущена'
 
-info 'ШАГ 8/9 — Проверка TCP-соединения с панелью после настройки UFW (до 60 секунд)...'
+info 'ШАГ 8/10 — Проверка TCP-соединения с панелью после настройки UFW (до 60 секунд)...'
 if ! check_panel_connection "$PANEL_IP" 60; then
   fail 'Нет активного TCP-соединения rw-node с указанным IP панели. UFW уже включён. Проверьте IP, настройки панели и firewall провайдера, затем используйте пункт 3.'
 fi
@@ -197,7 +199,7 @@ PYIP
 }
 
 configure_security() {
-info 'ШАГ 4/9 — Настройка Logrotate...'
+info 'ШАГ 4/10 — Настройка Logrotate...'
 if [[ ! -e "$ROTATE_FILE" ]]; then
 cat > "$ROTATE_FILE" <<'ROTATE'
 /var/log/remnanode/*.log {
@@ -214,7 +216,7 @@ fi
 logrotate -d "$ROTATE_FILE" >/dev/null 2>&1 || fail 'Ошибка проверки Logrotate.'
 report_done 4 'Настроен'
 
-info 'ШАГ 5/9 — Настройка UFW до запуска RemnaNode...'
+info 'ШАГ 5/10 — Настройка UFW до запуска RemnaNode...'
 # Existing rules may weaken the intended policy. Refuse to proceed rather
 # than resetting the firewall or deleting the user's existing rules.
 if ufw status | grep -Eiq '^2222(/tcp)?[[:space:]]+ALLOW[[:space:]]+Anywhere'; then
@@ -288,13 +290,14 @@ ufw status | grep -q '^Status: active' || fail 'UFW неактивен; запу
 report_done 5 'Включён'
 
 # Start/restart Fail2Ban after UFW has finished applying its rules.
-info 'ШАГ 6/9 — Включение защиты SSH через Fail2Ban...'
+info 'ШАГ 6/10 — Включение защиты SSH через Fail2Ban...'
 configure_fail2ban
 report_done 6 'Включена'
 }
 
 verify_installation() {
-info 'ШАГ 9/9 — Итоговая проверка...'
+configure_bbr
+info 'ШАГ 10/10 — Итоговая проверка...'
 systemctl is-active --quiet docker || fail 'Docker не запущен.'
 systemctl is-active --quiet fail2ban || fail 'Fail2Ban не запущен.'
 systemctl is-enabled --quiet fail2ban || fail 'Автозапуск Fail2Ban не включён.'
@@ -304,10 +307,51 @@ ufw status | grep -q '^Status: active' || fail 'UFW неактивен.'
 mount_ok=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/log/remnanode"}}{{.Source}}{{end}}{{end}}' remnanode)
 [[ "$mount_ok" == "$LOG_DIR" ]] || fail 'Каталог логов не примонтирован в RemnaNode.'
 logrotate -d "$ROTATE_FILE" >/dev/null 2>&1 || fail 'Ошибка проверки Logrotate.'
-report_done 9 'Пройдена'
+bbr_active || fail 'BBR не активен.'
+[[ "$(sysctl -n net.core.default_qdisc)" == fq ]] || fail 'Очередь fq не включена.'
+report_done 10 'Пройдена'
 finish_report 0
 unset PANEL_IP
 
+}
+
+bbr_active() {
+  [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" == bbr ]]
+}
+
+configure_bbr() {
+  info 'ШАГ 9/10 — Включение BBR и очереди fq...'
+  command -v sysctl >/dev/null 2>&1 || fail 'Для настройки BBR требуется sysctl (пакет procps).'
+  local available old_cc old_qdisc tmp
+  available=$(sysctl -n net.ipv4.tcp_available_congestion_control)
+  if [[ " $available " != *' bbr '* ]]; then
+    command -v modprobe >/dev/null 2>&1 || fail 'BBR недоступен; для загрузки модуля tcp_bbr требуется modprobe (пакет kmod).'
+    modprobe tcp_bbr || fail 'Не удалось загрузить tcp_bbr. Проверьте поддержку BBR ядром сервера.'
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control)
+    [[ " $available " == *' bbr '* ]] || fail 'Ядро сервера не предоставило BBR после загрузки модуля.'
+  fi
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe sch_fq >/dev/null 2>&1 || true
+  fi
+  old_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
+  old_qdisc=$(sysctl -n net.core.default_qdisc)
+  mkdir -p /etc/sysctl.d
+  [[ ! -L "$BBR_FILE" ]] || fail 'Файл настроек BBR является символической ссылкой; проверьте его вручную.'
+  tmp=$(mktemp "${BBR_FILE}.XXXXXXXX")
+  cat > "$tmp" <<'BBR'
+# Managed by Remnawave Node Manager.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+BBR
+  # Apply only our settings; do not reload unrelated sysctl configuration.
+  if ! sysctl -p "$tmp" || ! bbr_active || [[ "$(sysctl -n net.core.default_qdisc)" != fq ]]; then
+    sysctl -w "net.core.default_qdisc=$old_qdisc" "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || true
+    rm -f "$tmp"
+    fail 'Не удалось включить BBR/fq. Проверьте ограничения ядра или виртуализации сервера.'
+  fi
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$BBR_FILE"
+  report_done 9 'Активен (fq)'
 }
 
 configure_fail2ban() {
@@ -364,10 +408,10 @@ resume_node() {
   image=$(cd "$NODE_DIR" && docker compose config --images remnanode)
   [[ -n "$image" && "$image" != *$'\n'* ]] || fail 'Не удалось однозначно определить образ сервиса remnanode.'
   if ! docker image inspect "$image" >/dev/null 2>&1; then
-    info 'ШАГ 7/9 — Повторная загрузка отсутствующего образа RemnaNode...'
+    info 'ШАГ 7/10 — Повторная загрузка отсутствующего образа RemnaNode...'
     (cd "$NODE_DIR" && docker compose pull remnanode) || fail 'Не удалось скачать образ. Проверьте доступ к registry и повторите пункт 3.'
   fi
-  info 'ШАГ 7/9 — Создание или запуск остановленной RemnaNode...'
+  info 'ШАГ 7/10 — Создание или запуск остановленной RemnaNode...'
   # Reuse the local image; resuming must not implicitly pull a newer latest.
   (cd "$NODE_DIR" && docker compose up -d --pull never --no-build remnanode) || fail 'Не удалось запустить RemnaNode. Исправьте причину ошибки и повторите пункт 3.'
   [[ "$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null || true)" == running ]] || fail 'RemnaNode не перешла в состояние running. Проверьте docker logs remnanode.'
@@ -381,11 +425,11 @@ resume_mode() {
   . /etc/os-release
   [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == '24.04' ]] || fail 'Требуется Ubuntu 24.04 LTS.'
   [[ -f "$COMPOSE_FILE" ]] || fail "Конфигурация $COMPOSE_FILE отсутствует. Используйте пункт 1."
-  for cmd in docker python3 ss ufw logrotate iptables-restore; do
+  for cmd in docker python3 ss ufw logrotate iptables-restore sysctl; do
     command -v "$cmd" >/dev/null 2>&1 || fail "Не найдена команда $cmd. Для завершения сначала установите необходимый пакет вручную."
   done
   docker compose version >/dev/null 2>&1 || fail 'Docker Compose отсутствует.'
-  info 'ШАГ 3/9 — Проверка существующей конфигурации RemnaNode...'
+  info 'ШАГ 3/10 — Проверка существующей конфигурации RemnaNode...'
   (cd "$NODE_DIR" && docker compose config -q) || fail 'Конфигурация Compose некорректна.'
   report_done 3 'Проверена'
   ss -H -ltn '( sport = :22 )' | grep -q . || fail 'SSH не слушает порт 22.'
@@ -398,14 +442,14 @@ resume_mode() {
   validate_panel_ip "$PANEL_IP" || fail 'Некорректный публичный IPv4 панели.'
   info 'Применяем настройки безопасности и проверяем соединение после включения UFW.'
   configure_security
-  info 'ШАГ 7/9 — Восстановление запуска RemnaNode...'
+  info 'ШАГ 7/10 — Восстановление запуска RemnaNode...'
   systemctl enable --now docker || fail 'Не удалось запустить Docker.'
   systemctl is-active --quiet docker || fail 'Docker не запущен.'
   report_done 2 'Работают'
   REPORT_CURRENT=7
   resume_node
   report_done 7 'Работает'
-  info 'ШАГ 8/9 — Проверка текущего TCP-соединения с панелью (до 60 секунд)...'
+  info 'ШАГ 8/10 — Проверка текущего TCP-соединения с панелью (до 60 секунд)...'
   if ! check_panel_connection "$PANEL_IP" 60; then
     fail 'Не удалось подтвердить TCP-соединение с панелью после настройки UFW. Проверьте IP, настройки панели и firewall провайдера.'
   fi
@@ -463,6 +507,7 @@ audit_mode() {
   if command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client status sshd >/dev/null 2>&1; then
     mark OK 'Защита SSH через Fail2Ban (jail sshd) работает'
   else mark FAIL 'Защита SSH через Fail2Ban (jail sshd) не работает'; fi
+  if bbr_active; then mark OK 'BBR активен'; else mark WARN 'BBR не активен или недоступен'; fi
   printf '\n--- ПРАВИЛА UFW ---\n'
   if command -v ufw >/dev/null 2>&1; then
     local rules panel_ip
@@ -726,6 +771,16 @@ show_menu() {
     menu_status 'Logrotate' OK 'Настроен'
   else
     menu_status 'Logrotate' FAIL 'Ошибка конфигурации'
+  fi
+  if ! command -v sysctl >/dev/null 2>&1; then
+    menu_status 'BBR' WARN 'Не определён'
+  else
+    state=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    case "$state" in
+      bbr) menu_status 'BBR' OK 'Активен' ;;
+      '') menu_status 'BBR' WARN 'Не определён' ;;
+      *) menu_status 'BBR' WARN 'Не активен' ;;
+    esac
   fi
   printf '\n  1  Установить ноду\n  2  Проверить ноду\n  3  Продолжить установку\n\n  0  Выход\n\n'
 }
