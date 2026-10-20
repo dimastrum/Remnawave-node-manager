@@ -599,13 +599,10 @@ else:
         row('Локальный',ports((int(local.rsplit(':',1)[-1]),proto.lower())
                                for proto,local,proc,scope,state in entries if scope=='локальный'))
         core_udp=[entry for entry in entries if entry[0]=='UDP' and 'rw-core' in entry[2].split(', ')]
-        row('UDP-сокеты rw-core',f'{len(core_udp)} шт. — подробности по запросу')
+        row('UDP-сокеты rw-core',f'{len(core_udp)} шт.')
         other_udp=[entry for entry in entries if entry[0]=='UDP' and entry not in core_udp and entry[3]!='локальный']
         if other_udp:
             row('Другие UDP-сокеты',ports((int(entry[1].rsplit(':',1)[-1]),'udp') for entry in other_udp))
-        print('\n  Разрешения UFW не означают наличие слушающей службы.')
-        print('  Привязка сокета не доказывает доступность из интернета.')
-        print('  Диапазоны, профили и правила вне UFW требуют отдельной проверки.')
     risky=[(proto,local,proc) for proto,local,proc,scope,_ in entries if scope=='все адреса' and local.rsplit(':',1)[-1] in ('1080','3306','5432','6379','27017','2375','9200')]
     if risky:
         print('\n[!] СЛУЖБЫ, ТРЕБУЮЩИЕ ВНИМАНИЯ (привязаны ко всем адресам):')
@@ -754,11 +751,6 @@ PYCHECK
 
   if command -v ss >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     audit_ports "${panel_ip:-}" summary
-    local ports_details
-    read -r -p 'Показать полный список сокетов TCP/UDP? [д/Н]: ' ports_details || ports_details=''
-    case "$ports_details" in
-      д|Д|да|Да|y|Y|yes) audit_ports "${panel_ip:-}" details ;;
-    esac
   else mark WARN 'Для сводки портов нужны ss (iproute2) и Python 3'; fi
   printf '\n========== ИТОГ АУДИТА ==========\n'
   printf 'УСПЕШНО: %s | ПРЕДУПРЕЖДЕНИЯ: %s | ОШИБКИ: %s\n' "$PASS" "$WARN" "$FAIL"
