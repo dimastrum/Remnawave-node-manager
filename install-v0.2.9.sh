@@ -638,7 +638,7 @@ audit_mode() {
     state=$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null || true)
     if [[ "$state" == running ]]; then mark OK 'RemnaNode запущена'; else mark FAIL "Состояние RemnaNode: ${state:-не найден}"; fi
     # TCP state is more reliable than a log line that may have aged out.
-    # The expected panel IP is requested below, before UFW checks.
+    # The panel IP is detected below from the UFW rule for 2222/tcp.
     local mount
     mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/log/remnanode"}}{{.Source}}{{end}}{{end}}' remnanode 2>/dev/null || true)
     if [[ "$mount" == "$LOG_DIR" ]]; then mark OK 'Каталог логов примонтирован'; else mark WARN 'Каталог логов не примонтирован или путь отличается'; fi
@@ -658,12 +658,17 @@ audit_mode() {
     rules=$(ufw status numbered 2>&1 || true)
     if printf '%s\n' "$rules" | grep -q '^Status: active'; then mark OK 'UFW активен'; else mark FAIL 'UFW неактивен'; fi
     printf '%s\n' "$rules"
-    printf '\nIPv4 панели для проверки подключения и порта 2222 (Enter — определить по UFW): '
-    read -r panel_ip
-    if [[ -z "$panel_ip" ]]; then
-      panel_ip=$(printf '%s\n' "$rules" | sed -nE 's/^\[[[:space:]]*[0-9]+\][[:space:]]+2222\/tcp[[:space:]]+ALLOW IN[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)([[:space:]]+.*)?$/\1/p' | sort -u)
-      if [[ "$panel_ip" == *$'\n'* ]]; then panel_ip=''; fi
-      [[ -z "$panel_ip" ]] || printf '  [INFO] IP панели из правила UFW: %s (не подтверждён пользователем)\n' "$panel_ip"
+    # Only a single IPv4 host (/32 is equivalent) can identify the panel.
+    local panel_candidates
+    panel_ip=''
+    panel_candidates=$(printf '%s\n' "$rules" | sed -nE 's/^\[[[:space:]]*[0-9]+\][[:space:]]+2222\/tcp[[:space:]]+ALLOW[[:space:]]+IN[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)(\/32)?([[:space:]]+.*)?$/\1/p' | sort -u)
+    if [[ "$panel_candidates" == *$'\n'* ]]; then
+      mark WARN 'Для 2222/TCP разрешены несколько IPv4; однозначно определить панель нельзя'
+    elif [[ -z "$panel_candidates" ]]; then
+      mark WARN 'IPv4 панели не найден в правиле UFW для 2222/TCP'
+    else
+      panel_ip="$panel_candidates"
+      printf '\n  [INFO] IPv4 панели определён автоматически по UFW: %s\n' "$panel_ip"
     fi
     printf '\n--- СОЕДИНЕНИЕ С ПАНЕЛЬЮ ---\n'
     if [[ -n "$panel_ip" ]] && command -v ss >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
