@@ -761,24 +761,85 @@ PYCHECK
 
 }
 
-menu_status() {
-  local label="$1" level="$2" message="$3" color='' reset=''
-  local LC_CTYPE=C.UTF-8
+ui_init() {
+  UI_RESET='' UI_BOLD='' UI_CYAN='' UI_BLUE='' UI_GREEN='' UI_YELLOW='' UI_RED='' UI_GRAY=''
   if [[ -t 1 && "${TERM:-dumb}" != dumb && -z "${NO_COLOR+x}" ]]; then
-    reset=$'\033[0m'
-    case "$level" in
-      OK) color=$'\033[32m' ;;
-      FAIL) color=$'\033[31m' ;;
-      *) color=$'\033[33m' ;;
-    esac
+    UI_RESET=$'\033[0m' UI_BOLD=$'\033[1m'
+    UI_CYAN=$'\033[96m' UI_BLUE=$'\033[94m' UI_GREEN=$'\033[32m'
+    UI_YELLOW=$'\033[33m' UI_RED=$'\033[31m' UI_GRAY=$'\033[90m'
   fi
-  # Bash printf field width counts bytes; pad separately for Cyrillic labels.
-  printf '  %s%*s %b●%b %s\n' "$label" "$((14-${#label}))" '' "$color" "$reset" "$message"
+}
+
+menu_status() {
+  MENU_LABELS+=("$1")
+  MENU_LEVELS+=("$2")
+  MENU_MESSAGES+=("$3")
+}
+
+menu_border() {
+  local line
+  printf -v line '%*s' "$MENU_WIDTH" ''
+  line=${line// /─}
+  printf '%s%s%s%s%s\n' "$UI_CYAN" "$1" "$line" "$2" "$UI_RESET"
+}
+
+menu_row() {
+  local plain="$1" styled="${2-$1}"
+  local LC_CTYPE=C.UTF-8
+  printf '%s│%s%s%*s%s│%s\n' "$UI_CYAN" "$UI_RESET" "$styled" "$((MENU_WIDTH-${#plain}))" '' "$UI_CYAN" "$UI_RESET"
+}
+
+menu_center() {
+  local text="$1" style="$2" padding plain
+  local LC_CTYPE=C.UTF-8
+  printf -v padding '%*s' "$(((MENU_WIDTH-${#text})/2))" ''
+  plain="$padding$text"
+  menu_row "$plain" "$padding$style$text$UI_RESET"
+}
+
+render_menu() {
+  local i label padding plain styled color
+  local LC_CTYPE=C.UTF-8
+  # Size the frame from plain text; ANSI escapes never affect its width.
+  local MENU_WIDTH=42
+  for ((i=0; i<${#MENU_LABELS[@]}; i++)); do
+    (( 21+${#MENU_MESSAGES[$i]} <= MENU_WIDTH )) || MENU_WIDTH=$((21+${#MENU_MESSAGES[$i]}))
+  done
+  printf '\n'
+  menu_border '╭' '╮'
+  menu_center 'REMNAWAVE NODE MANAGER' "$UI_BOLD$UI_CYAN"
+  menu_center 'v0.2.9' "$UI_GRAY"
+  menu_border '├' '┤'
+  menu_row ''
+  for ((i=0; i<${#MENU_LABELS[@]}; i++)); do
+    label=${MENU_LABELS[$i]}
+    printf -v padding '%*s' "$((14-${#label}))" ''
+    case "${MENU_LEVELS[$i]}" in
+      OK) color=$UI_GREEN ;;
+      FAIL) color=$UI_RED ;;
+      *) color=$UI_YELLOW ;;
+    esac
+    plain="  $label$padding ● ${MENU_MESSAGES[$i]}"
+    styled="  $UI_BOLD$label$UI_RESET$padding $color● ${MENU_MESSAGES[$i]}$UI_RESET"
+    menu_row "$plain" "$styled"
+  done
+  menu_row ''
+  menu_border '├' '┤'
+  menu_row ''
+  menu_row '  1  Установить ноду' "  $UI_BOLD${UI_BLUE}1$UI_RESET  Установить ноду"
+  menu_row '  2  Проверить ноду' "  $UI_BOLD${UI_BLUE}2$UI_RESET  Проверить ноду"
+  menu_row '  3  Продолжить установку' "  $UI_BOLD${UI_BLUE}3$UI_RESET  Продолжить установку"
+  menu_row ''
+  menu_row '  0  Выход' "  ${UI_GRAY}0  Выход$UI_RESET"
+  menu_row ''
+  menu_border '╰' '╯'
+  printf '\n'
 }
 
 show_menu() {
   local state firewall_active=false
-  printf '\n╭──────────────────────────────────────╮\n│       REMNAWAVE NODE MANAGER         │\n│                v0.2.9                │\n╰──────────────────────────────────────╯\n\n'
+  local -a MENU_LABELS=() MENU_LEVELS=() MENU_MESSAGES=()
+  ui_init
   if ! command -v docker >/dev/null 2>&1; then
     menu_status 'Нода' WARN 'Не установлена'
   elif ! docker info >/dev/null 2>&1; then
@@ -838,13 +899,13 @@ show_menu() {
       *) menu_status 'BBR' WARN 'Не активен' ;;
     esac
   fi
-  printf '\n  1  Установить ноду\n  2  Проверить ноду\n  3  Продолжить установку\n\n  0  Выход\n\n'
+  render_menu
 }
 
 [[ "$EUID" -eq 0 ]] || fail 'Запустите от root или через sudo.'
 [[ -t 0 ]] || fail 'Нужен интерактивный терминал.'
 show_menu
-read -r -p 'Выберите пункт: ' choice
+read -r -p "${UI_BOLD}${UI_CYAN}  Выберите пункт: ${UI_RESET}" choice
 case "$choice" in
   1) install_mode ;;
   2) audit_mode ;;
