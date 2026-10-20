@@ -595,7 +595,7 @@ else:
             if any(act!='ALLOW' for _,_,act,_,_ in rules):
                 row('Внимание','Есть DENY/REJECT; учитывайте порядок правил')
             if unparsed:
-                row('Дополнительные правила',f'{len(unparsed)} шт. — см. вывод UFW выше')
+                row('Дополнительные правила',f'{len(unparsed)} шт. — не включены в сводку')
         row('Локальный',ports((int(local.rsplit(':',1)[-1]),proto.lower())
                                for proto,local,proc,scope,state in entries if scope=='локальный'))
         core_udp=[entry for entry in entries if entry[0]=='UDP' and 'rw-core' in entry[2].split(', ')]
@@ -649,12 +649,10 @@ audit_mode() {
     mark OK 'Защита SSH через Fail2Ban (jail sshd) работает'
   else mark FAIL 'Защита SSH через Fail2Ban (jail sshd) не работает'; fi
   if bbr_active; then mark OK 'BBR активен'; else mark WARN 'BBR не активен или недоступен'; fi
-  printf '\n--- ПРАВИЛА UFW ---\n'
   if command -v ufw >/dev/null 2>&1; then
     local rules panel_ip
     rules=$(ufw status numbered 2>&1 || true)
     if printf '%s\n' "$rules" | grep -q '^Status: active'; then mark OK 'UFW активен'; else mark FAIL 'UFW неактивен'; fi
-    printf '%s\n' "$rules"
     # Only a single IPv4 host (/32 is equivalent) can identify the panel.
     local panel_candidates
     panel_ip=''
