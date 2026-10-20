@@ -27,6 +27,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dimastrum/Remnawave-node-man
 | 3 | Продолжить установку после сбоя |
 | 0 | Выход |
 
+Аудит показывает краткую сводку разрешений UFW и локальных портов. UDP-сокеты `rw-core` свёрнуты в счётчик; полный список TCP/UDP можно раскрыть по запросу.
+
 ## Что настраивается
 
 - Docker, Compose и RemnaNode.

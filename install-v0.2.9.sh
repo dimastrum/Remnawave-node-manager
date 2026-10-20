@@ -470,6 +470,150 @@ check_service() {
   if systemctl is-active --quiet "$name" 2>/dev/null; then mark OK "$name: работает"; else mark FAIL "$name неактивен или отсутствует"; fi
 }
 
+audit_ports() {
+  python3 - "$1" "$2" <<'PYPORTS'
+import ipaddress,re,subprocess,sys
+
+def run(*args):
+    try: return subprocess.run(args,capture_output=True,text=True,check=False)
+    except OSError: return None
+
+ss=run('ss','-H','-tulnp')
+ufw=run('ufw','status','verbose')
+fw=ufw.stdout if ufw else ''
+active=bool(re.search(r'^Status:\s*active\s*$',fw,re.M))
+# Parse both numbered and unnumbered UFW output; do not assume English comments.
+rules=[]
+unparsed=[]
+for line in fw.splitlines():
+    line=re.sub(r'^\s*\[\s*\d+\]\s*','',line)
+    m=re.match(r'^\s*(\d+(?:/(?:tcp|udp))?(?:\s+\(v6\))?)\s+(ALLOW|DENY|REJECT)\s+IN\s+(.+?)\s*$',line)
+    if not m:
+        if re.search(r'\b(?:ALLOW|DENY|REJECT|LIMIT)\s+IN\b',line): unparsed.append(line.strip())
+        continue
+    dest,action,source=m.groups()
+    source=source.split(' #',1)[0].strip()
+    ipv6='(v6)' in dest or '(v6)' in source
+    dest=dest.replace('(v6)','').strip()
+    # Port ranges, application profiles, interface rules and addresses are not guessed.
+    port_match=re.fullmatch(r'(\d+)(?:/(tcp|udp))?',dest,re.I)
+    if port_match:
+        rules.append((int(port_match.group(1)),(port_match.group(2) or '').lower(),action,source,ipv6))
+
+def family_of(addr):
+    if addr.startswith('[::ffff:'): return 4
+    if addr.startswith('['): return 6
+    if addr in ('*','::'): return 0
+    if ':' in addr: return 6
+    return 4
+
+def scope_of(addr):
+    clean=addr.strip('[]').split('%',1)[0]
+    try:
+        ip=ipaddress.ip_address(clean)
+        if ip.is_loopback: return 'локальный'
+        if ip.is_unspecified: return 'все адреса'
+        return 'конкретный IP'
+    except ValueError:
+        return 'все адреса' if clean=='*' else 'неизвестно'
+
+def firewall_state(port,proto,family,scope):
+    if scope=='локальный': return 'локальный'
+    if not active: return 'UFW выключен' if ufw else 'неизвестно'
+    # Wildcard dual-stack listeners may serve both families: show both independently.
+    families=(4,6) if family==0 else (family,)
+    def one(fam):
+        applicable=[(act,src) for p,pr,act,src,v6 in rules
+                    if p==port and (not pr or pr==proto) and v6==(fam==6)]
+        if not applicable: return 'нет явного ALLOW'
+        # Conservative: don't claim access when deny and allow rules coexist.
+        if any(act!='ALLOW' for act,_ in applicable): return 'смешанные правила'
+        if any(src in ('Anywhere','Anywhere (v6)') for _,src in applicable): return 'ALLOW всем'
+        return 'ALLOW по IP'
+    results=[one(fam) for fam in families]
+    if len(results)==1: return results[0]
+    return 'v4:'+results[0]+' / v6:'+results[1]
+
+if not ss or ss.returncode:
+    print('Не удалось получить список портов: '+(ss.stderr.strip() if ss else 'ss отсутствует'))
+else:
+    entries=[]
+    for line in ss.stdout.splitlines():
+        fields=line.split(maxsplit=6)
+        if len(fields)<5: continue
+        proto,_,_,_,local=fields[:5]
+        if proto.lower() not in ('tcp','udp'): continue
+        names=list(dict.fromkeys(re.findall(r'\("([^"]+)"',fields[6] if len(fields)>6 else '')))
+        proc=', '.join(names) if names else 'не определён'
+        try: port=int(local.rsplit(':',1)[-1])
+        except ValueError: continue
+        addr=local.rsplit(':',1)[0]
+        family=family_of(addr)
+        scope=scope_of(addr)
+        state=firewall_state(port,proto.lower(),family,scope)
+        entries.append((proto.upper(),local,proc,scope,state))
+    if sys.argv[2]=='details':
+        print('\n========== ПОЛНЫЙ СПИСОК СОКЕТОВ (TCP/UDP) ==========')
+        headers=['ПРОТОКОЛ','АДРЕС:ПОРТ','ПРОЦЕСС','ПРИВЯЗКА','UFW (оценка)']
+        widths=[9,27,22,15,43]
+        print('  '.join(f'{h:<{w}}' for h,w in zip(headers,widths)))
+        print('-'*125)
+        for entry in entries:
+            print('  '.join(f'{str(x)[:w]:<{w}}' for x,w in zip(entry,widths)))
+    else:
+        print('\n========== КРАТКО О ПОРТАХ ==========')
+        def row(label,value): print(f'  {label:<24} {value}')
+        def ports(values):
+            return ', '.join(f'{p}/{pr.upper() if pr else "TCP+UDP"}' for p,pr in sorted(set(values))) or 'Нет'
+        if not ufw or ufw.returncode:
+            row('Правила UFW','Не удалось получить')
+        elif not active:
+            row('Правила UFW','UFW выключен — доступ не ограничен его правилами')
+        else:
+            public=[]; restricted={}
+            for p,pr,act,src,v6 in rules:
+                if act!='ALLOW': continue
+                clean=src.replace('(v6)','').strip()
+                if clean=='Anywhere': public.append((p,pr))
+                else: restricted.setdefault(clean,set()).add((p,pr))
+            row('Доступ разрешён всем',ports(public))
+            default_deny=bool(re.search(r'^Default:\s*(deny|reject)\s*\(incoming\)',fw,re.M))
+            api_sources={src.replace('(v6)','').strip() for p,pr,act,src,v6 in rules
+                         if p==2222 and pr in ('','tcp') and act=='ALLOW'}
+            api_denies=any(p==2222 and pr in ('','tcp') and act!='ALLOW' for p,pr,act,src,v6 in rules)
+            for src,allowed in sorted(restricted.items()):
+                label='Доступ по IP'
+                api={(p,pr) for p,pr in allowed if p==2222 and pr=='tcp'}
+                if src==sys.argv[1] and api:
+                    exclusive=default_deny and api_sources=={src} and not api_denies and not unparsed
+                    row('Только панели' if exclusive else 'Правило для панели',ports(api)+' → '+src)
+                    allowed=allowed-api
+                if allowed: row(label,ports(allowed)+' → '+src)
+            if not restricted: row('Доступ по IP','Нет явных разрешений')
+            if not default_deny:
+                row('Внимание','Запрет входящих по умолчанию не подтверждён')
+            if any(act!='ALLOW' for _,_,act,_,_ in rules):
+                row('Внимание','Есть DENY/REJECT; учитывайте порядок правил')
+            if unparsed:
+                row('Дополнительные правила',f'{len(unparsed)} шт. — см. вывод UFW выше')
+        row('Локальный',ports((int(local.rsplit(':',1)[-1]),proto.lower())
+                               for proto,local,proc,scope,state in entries if scope=='локальный'))
+        core_udp=[entry for entry in entries if entry[0]=='UDP' and 'rw-core' in entry[2].split(', ')]
+        row('UDP-сокеты rw-core',f'{len(core_udp)} шт. — подробности по запросу')
+        other_udp=[entry for entry in entries if entry[0]=='UDP' and entry not in core_udp and entry[3]!='локальный']
+        if other_udp:
+            row('Другие UDP-сокеты',ports((int(entry[1].rsplit(':',1)[-1]),'udp') for entry in other_udp))
+        print('\n  Разрешения UFW не означают наличие слушающей службы.')
+        print('  Привязка сокета не доказывает доступность из интернета.')
+        print('  Диапазоны, профили и правила вне UFW требуют отдельной проверки.')
+    risky=[(proto,local,proc) for proto,local,proc,scope,_ in entries if scope=='все адреса' and local.rsplit(':',1)[-1] in ('1080','3306','5432','6379','27017','2375','9200')]
+    if risky:
+        print('\n[!] СЛУЖБЫ, ТРЕБУЮЩИЕ ВНИМАНИЯ (привязаны ко всем адресам):')
+        for proto,local,proc in risky: print(f'    {proto} {local} — {proc}')
+        print('    Проверьте авторизацию и ограничения доступа. Это не доказывает доступность извне.')
+PYPORTS
+}
+
 # Audit reads configuration and runtime state only. No installation, restart, reload or file writes.
 audit_mode() {
   PASS=0 WARN=0 FAIL=0
@@ -603,102 +747,14 @@ PYCHECK
     then mark OK 'Правила ICMP INPUT/FORWARD соответствуют ожидаемым'; else mark WARN 'Правила ICMP отличаются от ожидаемых'; fi
   else mark WARN 'Файл UFW before.rules недоступен'; fi
 
-  printf '\n========== ПРОСЛУШИВАЕМЫЕ ПОРТЫ (TCP/UDP) ==========\n'
   if command -v ss >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
-    python3 - <<'PYPORTS'
-import ipaddress,re,subprocess
-
-def run(*args):
-    try: return subprocess.run(args,capture_output=True,text=True,check=False)
-    except OSError: return None
-
-ss=run('ss','-H','-tulnp')
-ufw=run('ufw','status','numbered')
-fw=ufw.stdout if ufw else ''
-active=bool(re.search(r'^Status:\s*active\s*$',fw,re.M))
-# Parse both numbered and unnumbered UFW output; do not assume English comments.
-rules=[]
-for line in fw.splitlines():
-    line=re.sub(r'^\s*\[\s*\d+\]\s*','',line)
-    m=re.match(r'^\s*(\d+(?:/(?:tcp|udp))?(?:\s+\(v6\))?)\s+(ALLOW|DENY|REJECT)\s+IN\s+(.+?)\s*$',line)
-    if not m: continue
-    dest,action,source=m.groups()
-    source=source.split(' #',1)[0].strip()
-    ipv6='(v6)' in dest or '(v6)' in source
-    dest=dest.replace('(v6)','').strip()
-    # Port ranges, application profiles, interface rules and addresses are not guessed.
-    port_match=re.fullmatch(r'(\d+)(?:/(tcp|udp))?',dest,re.I)
-    if port_match:
-        rules.append((int(port_match.group(1)),(port_match.group(2) or '').lower(),action,source,ipv6))
-
-def family_of(addr):
-    if addr.startswith('[::ffff:'): return 4
-    if addr.startswith('['): return 6
-    if addr in ('*','::'): return 0
-    if ':' in addr: return 6
-    return 4
-
-def scope_of(addr):
-    clean=addr.strip('[]').split('%',1)[0]
-    try:
-        ip=ipaddress.ip_address(clean)
-        if ip.is_loopback: return 'локальный'
-        if ip.is_unspecified: return 'все адреса'
-        return 'конкретный IP'
-    except ValueError:
-        return 'все адреса' if clean=='*' else 'неизвестно'
-
-def firewall_state(port,proto,family,scope):
-    if scope=='локальный': return 'локальный'
-    if not active: return 'UFW выключен' if ufw else 'неизвестно'
-    # Wildcard dual-stack listeners may serve both families: show both independently.
-    families=(4,6) if family==0 else (family,)
-    def one(fam):
-        applicable=[(act,src) for p,pr,act,src,v6 in rules
-                    if p==port and (not pr or pr==proto) and v6==(fam==6)]
-        if not applicable: return 'нет явного ALLOW'
-        # Conservative: don't claim access when deny and allow rules coexist.
-        if any(act!='ALLOW' for act,_ in applicable): return 'смешанные правила'
-        if any(src in ('Anywhere','Anywhere (v6)') for _,src in applicable): return 'ALLOW всем'
-        return 'ALLOW по IP'
-    results=[one(fam) for fam in families]
-    if len(results)==1: return results[0]
-    return 'v4:'+results[0]+' / v6:'+results[1]
-
-if not ss or ss.returncode:
-    print('Не удалось получить список портов: '+(ss.stderr.strip() if ss else 'ss отсутствует'))
-else:
-    entries=[]
-    for line in ss.stdout.splitlines():
-        fields=line.split(maxsplit=6)
-        if len(fields)<5: continue
-        proto,_,_,_,local=fields[:5]
-        if proto.lower() not in ('tcp','udp'): continue
-        names=list(dict.fromkeys(re.findall(r'\("([^"]+)"',fields[6] if len(fields)>6 else '')))
-        proc=', '.join(names) if names else 'не определён'
-        try: port=int(local.rsplit(':',1)[-1])
-        except ValueError: continue
-        addr=local.rsplit(':',1)[0]
-        family=family_of(addr)
-        scope=scope_of(addr)
-        state=firewall_state(port,proto.lower(),family,scope)
-        entries.append((proto.upper(),local,proc,scope,state))
-    headers=['ПРОТОКОЛ','АДРЕС:ПОРТ','ПРОЦЕСС','ПРИВЯЗКА','UFW (оценка)']
-    widths=[9,27,22,15,43]
-    print('  '.join(f'{h:<{w}}' for h,w in zip(headers,widths)))
-    print('-'*125)
-    for entry in entries:
-        print('  '.join(f'{str(x)[:w]:<{w}}' for x,w in zip(entry,widths)))
-    print('\nПРИМЕЧАНИЕ: UFW (оценка) — только явные правила из ufw status numbered.')
-    print('Правила с диапазонами, интерфейсами, порядок обработки, default policy, Docker, IPv6 и firewall провайдера могут изменить результат.')
-    print('Слушающий порт не обязательно доступен извне. Для проверки доступности нужен внешний тест.')
-    risky=[(proto,local,proc) for proto,local,proc,scope,_ in entries if scope=='все адреса' and local.rsplit(':',1)[-1] in ('1080','3306','5432','6379','27017','2375','9200')]
-    if risky:
-        print('\n[!] СЛУЖБЫ, ТРЕБУЮЩИЕ ВНИМАНИЯ (привязаны ко всем адресам):')
-        for proto,local,proc in risky: print(f'    {proto} {local} — {proc}')
-        print('    Проверьте авторизацию и ограничения доступа. Это не доказывает доступность извне.')
-PYPORTS
-  else mark WARN 'Для таблицы портов нужны ss (iproute2) и Python 3'; fi
+    audit_ports "${panel_ip:-}" summary
+    local ports_details
+    read -r -p 'Показать полный список сокетов TCP/UDP? [д/Н]: ' ports_details || ports_details=''
+    case "$ports_details" in
+      д|Д|да|Да|y|Y|yes) audit_ports "${panel_ip:-}" details ;;
+    esac
+  else mark WARN 'Для сводки портов нужны ss (iproute2) и Python 3'; fi
   printf '\n========== ИТОГ АУДИТА ==========\n'
   printf 'УСПЕШНО: %s | ПРЕДУПРЕЖДЕНИЯ: %s | ОШИБКИ: %s\n' "$PASS" "$WARN" "$FAIL"
   printf 'Режим аудита не изменяет файлы, службы и правила файрвола.\n'
